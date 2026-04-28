@@ -15,6 +15,34 @@ pub fn getpid() -> isize {
 pub fn fork() -> isize {
     sys_fork()
 }
+
+/// Mirror of the kernel `UserHeapStats` struct. Field order MUST match
+/// `os/src/syscall/process.rs::UserHeapStats`.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub struct KernelHeapStats {
+    pub buddy_total: u64,
+    pub buddy_used: u64,
+    pub slab_provisioned: u64,
+    pub slab_free: u64,
+    pub allocs: u64,
+    pub frees: u64,
+    pub bytes_allocated: u64,
+    pub bytes_freed: u64,
+    pub slab_hits: u64,
+    pub buddy_calls: u64,
+    pub oom: u64,
+}
+
+/// Grow (or shrink) the user heap. Returns the previous heap top, or -1.
+pub fn sbrk(delta: i32) -> isize {
+    sys_sbrk(delta)
+}
+
+/// Snapshot the kernel heap counters into `out`. Returns true on success.
+pub fn read_heap_stats(out: &mut KernelHeapStats) -> bool {
+    sys_heap_stats(out as *mut KernelHeapStats as *mut u8) == 0
+}
 pub fn exec(path: &str, args: &[*const u8]) -> isize {
     sys_exec(path, args)
 }

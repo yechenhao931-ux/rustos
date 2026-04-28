@@ -13,9 +13,11 @@ const SYSCALL_YIELD: usize = 124;
 const SYSCALL_KILL: usize = 129;
 const SYSCALL_GET_TIME: usize = 169;
 const SYSCALL_GETPID: usize = 172;
+const SYSCALL_SBRK: usize = 214;
 const SYSCALL_FORK: usize = 220;
 const SYSCALL_EXEC: usize = 221;
 const SYSCALL_WAITPID: usize = 260;
+const SYSCALL_HEAP_STATS: usize = 4000;
 const SYSCALL_THREAD_CREATE: usize = 1000;
 const SYSCALL_GETTID: usize = 1001;
 const SYSCALL_WAITTID: usize = 1002;
@@ -192,4 +194,12 @@ pub fn sys_event_get() -> isize {
 
 pub fn sys_key_pressed() -> isize {
     syscall(SYSCALL_KEY_PRESSED, [0, 0, 0])
+}
+
+pub fn sys_sbrk(delta: i32) -> isize {
+    syscall(SYSCALL_SBRK, [delta as usize, 0, 0])
+}
+
+pub fn sys_heap_stats(out: *mut u8) -> isize {
+    syscall(SYSCALL_HEAP_STATS, [out as usize, 0, 0])
 }

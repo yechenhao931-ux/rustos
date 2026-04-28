@@ -4,6 +4,7 @@ use super::manager::insert_into_pid2process;
 use super::{PidHandle, pid_alloc};
 use super::{SignalFlags, add_task};
 use crate::fs::{File, Stdin, Stdout};
+use crate::config::USER_HEAP_BASE;
 use crate::mm::{KERNEL_SPACE, MemorySet, translated_refmut};
 use crate::sync::{Condvar, Mutex, Semaphore, UPIntrFreeCell, UPIntrRefMut};
 use crate::trap::{TrapContext, trap_handler};
@@ -32,6 +33,9 @@ pub struct ProcessControlBlockInner {
     pub mutex_list: Vec<Option<Arc<dyn Mutex>>>,
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    /// Current end of the per-process user heap (managed via `sys_sbrk`).
+    /// Equal to `USER_HEAP_BASE` when no heap is allocated.
+    pub heap_top: usize,
 }
 
 impl ProcessControlBlockInner {
@@ -99,6 +103,7 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    heap_top: USER_HEAP_BASE,
                 })
             },
         });
@@ -137,8 +142,12 @@ impl ProcessControlBlock {
         // memory_set with elf program headers/trampoline/trap context/user stack
         let (memory_set, ustack_base, entry_point) = MemorySet::from_elf(elf_data);
         let new_token = memory_set.token();
-        // substitute memory_set
-        self.inner_exclusive_access().memory_set = memory_set;
+        // substitute memory_set; the new program starts with an empty heap.
+        {
+            let mut inner = self.inner_exclusive_access();
+            inner.memory_set = memory_set;
+            inner.heap_top = USER_HEAP_BASE;
+        }
         // then we alloc user resource for main thread again
         // since memory_set has been changed
         let task = self.inner_exclusive_access().get_task(0);
@@ -218,6 +227,7 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    heap_top: parent.heap_top,
                 })
             },
         });

@@ -59,6 +59,25 @@ cp os/src/linker-qemu.ld os/src/linker.ld
 cd os && make run
 ```
 
+## End-to-end test from a user program
+
+Two new syscalls let userland exercise and observe the kernel heap:
+
+* `sys_sbrk(delta)` (id 214) — grow/shrink the per-process user heap.
+  Each page added triggers `frame_alloc` + `BTreeMap` insert + page-table
+  walk, which together generate a handful of kernel-heap allocations of
+  varied sizes — exactly the slab+buddy fast path.
+* `sys_heap_stats(*out)` (id 4000) — copy the kernel-heap counters
+  (allocs, frees, slab hits, buddy calls, peak usage) into the user.
+
+The `heaptest` user program (`user/src/bin/heaptest.rs`) takes a
+before-snapshot, runs grow/shrink/churn phases, takes an after-snapshot,
+and prints kernel-side throughput plus slab hit rate. Run it from the
+rCore shell after booting (`>> heaptest`). Source-of-truth for the
+syscall layout lives next to the syscall, in
+`os/src/syscall/process.rs::UserHeapStats` /
+`user/src/task.rs::KernelHeapStats`.
+
 ## What's in `kalloc`
 
 * **Buddy allocator** (`allocator/src/buddy.rs`). Per-order intrusive

@@ -71,6 +71,67 @@ impl MemorySet {
             self.areas.remove(idx);
         }
     }
+    /// Grow or shrink a user heap rooted at `heap_base`.
+    ///
+    /// `current_top` is where the heap currently ends; `new_top` is where it
+    /// should end after this call. On grow we lazily create the area on the
+    /// first non-empty extension. On shrink-to-empty we remove the area.
+    /// Returns `true` on success, `false` if the request is invalid (e.g.
+    /// shrinking below `heap_base` or the kernel is out of frames).
+    pub fn resize_heap(
+        &mut self,
+        heap_base: usize,
+        current_top: usize,
+        new_top: usize,
+    ) -> bool {
+        if new_top < heap_base {
+            return false;
+        }
+        if new_top == current_top {
+            return true;
+        }
+        let base_vpn: VirtPageNum = VirtAddr::from(heap_base).into();
+        // Locate (or lazily create) the heap area, identified by its start vpn.
+        if new_top > current_top {
+            let new_end_vpn: VirtPageNum = VirtAddr::from(new_top).ceil();
+            // Either we already have a heap area, or this is the first growth.
+            if let Some(area) = self
+                .areas
+                .iter_mut()
+                .find(|a| a.vpn_range.get_start() == base_vpn)
+            {
+                area.grow_to(&mut self.page_table, new_end_vpn)
+            } else {
+                let perm = MapPermission::R | MapPermission::W | MapPermission::U;
+                let mut area = MapArea::new(
+                    VirtAddr::from(heap_base),
+                    VirtAddr::from(new_top),
+                    MapType::Framed,
+                    perm,
+                );
+                area.map(&mut self.page_table);
+                self.areas.push(area);
+                true
+            }
+        } else {
+            let new_end_vpn: VirtPageNum = VirtAddr::from(new_top).ceil();
+            let Some(idx) = self
+                .areas
+                .iter()
+                .position(|a| a.vpn_range.get_start() == base_vpn)
+            else {
+                // No area to shrink; treat as success only if new_top == base.
+                return new_top == heap_base;
+            };
+            if new_end_vpn == base_vpn {
+                let mut area = self.areas.remove(idx);
+                area.unmap(&mut self.page_table);
+            } else {
+                self.areas[idx].shrink_to(&mut self.page_table, new_end_vpn);
+            }
+            true
+        }
+    }
     /// Add a new MapArea into this MemorySet.
     /// Assuming that there are no conflicts in the virtual address
     /// space.
@@ -313,6 +374,39 @@ impl MapArea {
         for vpn in self.vpn_range {
             self.unmap_one(page_table, vpn);
         }
+    }
+    /// Extend this area's vpn_range up to `new_end_vpn` (exclusive), mapping
+    /// fresh frames for each new vpn. No-op if `new_end_vpn` is not larger.
+    /// Returns false if any frame allocation fails (no rollback — caller
+    /// treats the area as invalid in that case, matching the kernel's
+    /// existing behaviour on OOM).
+    pub fn grow_to(&mut self, page_table: &mut PageTable, new_end_vpn: VirtPageNum) -> bool {
+        let cur_end = self.vpn_range.get_end();
+        if new_end_vpn.0 <= cur_end.0 {
+            return true;
+        }
+        let mut vpn = cur_end;
+        while vpn.0 < new_end_vpn.0 {
+            self.map_one(page_table, vpn);
+            vpn.step();
+        }
+        self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end_vpn);
+        true
+    }
+    /// Trim this area down to `new_end_vpn` (exclusive). Caller must ensure
+    /// `new_end_vpn >= start_vpn`; passing `start_vpn` here is allowed and
+    /// leaves an empty area which the caller should then remove.
+    pub fn shrink_to(&mut self, page_table: &mut PageTable, new_end_vpn: VirtPageNum) {
+        let cur_end = self.vpn_range.get_end();
+        if new_end_vpn.0 >= cur_end.0 {
+            return;
+        }
+        let mut vpn = new_end_vpn;
+        while vpn.0 < cur_end.0 {
+            self.unmap_one(page_table, vpn);
+            vpn.step();
+        }
+        self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end_vpn);
     }
     /// data: start-aligned but maybe with shorter length
     /// assume that all frames were cleared before

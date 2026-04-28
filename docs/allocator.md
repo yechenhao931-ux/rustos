@@ -148,6 +148,56 @@ cp os/src/linker-qemu.ld os/src/linker.ld
 ( cd os && cargo build --release --target riscv64gc-unknown-none-elf )
 ```
 
+## End-to-end benchmark via `sys_sbrk` + `heaptest`
+
+Host benchmarks measure the allocator on a synthetic workload. To check
+that the win shows up in the actual kernel, we added two syscalls:
+
+| syscall id | name             | semantics                                   |
+| ---------- | ---------------- | ------------------------------------------- |
+| 214        | `sys_sbrk(d)`    | grow/shrink user heap by `d` bytes (Linux-style) |
+| 4000       | `sys_heap_stats(*out)` | copy a snapshot of kernel heap counters out |
+
+`sys_sbrk` walks the kernel allocator hard: every page mapped requires a
+`frame_alloc`, a `BTreeMap<VirtPageNum, FrameTracker>` insert (kernel-heap
+allocation, slab class 64 B), and zero-or-more `PageTable::map` calls
+that may allocate mid-level page-table frames. A loop of `sbrk(+page)`
+calls is a clean way to drive a known number of small kernel-heap
+allocations from a user program.
+
+`sys_heap_stats` returns:
+
+```rust
+struct KernelHeapStats {
+    buddy_total, buddy_used,         // bytes managed / in use by buddy
+    slab_provisioned, slab_free,     // bytes pulled into slab caches
+    allocs, frees,                   // total kernel-heap calls
+    bytes_allocated, bytes_freed,
+    slab_hits, buddy_calls,          // routing distribution
+    oom,
+}
+```
+
+Take a snapshot before and after a phase and the diff tells you exactly
+how much kernel-heap traffic the workload generated and how the slab
+absorbed it.
+
+The `heaptest` user program (`user/src/bin/heaptest.rs`) does this in
+three phases:
+
+1. Grow heap by 64 pages, touch each page, shrink back, record diff.
+2. Grow heap by 256 pages, same.
+3. 500 rounds of churn: `sbrk(+8 KiB); sbrk(-8 KiB)`.
+
+Run it from the rCore shell:
+
+```
+>> heaptest
+```
+
+The output reports kernel allocs/frees, slab hit rate, and average µs
+per `sbrk` call — directly comparable across allocator implementations.
+
 ## Possible next steps
 
 * **Per-CPU magazines.** Linux SLUB caches one slab per CPU to drop the
