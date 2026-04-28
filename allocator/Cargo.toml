@@ -1,0 +1,18 @@
+[package]
+name = "kalloc"
+version = "0.1.0"
+edition = "2021"
+description = "Two-level (buddy + slab) kernel heap allocator, no_std"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = []
+# Track per-size-class statistics. Adds a few atomic ops per alloc/free.
+stats = []
+# Enable std-only test helpers (used by allocator-bench and unit tests).
+std = []
+
+[dependencies]
+spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex"] }
+
+[dev-dependencies]

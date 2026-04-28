@@ -1,0 +1,18 @@
+[package]
+name = "allocator-bench"
+version = "0.1.0"
+edition = "2021"
+description = "Host-side benchmarks comparing kalloc against baseline allocators"
+
+[features]
+# Build with `cargo build --release --features stats` to also report slab
+# hit rates. Stats add ~30 ns/op of atomic ops, so timing regresses; use
+# only when characterizing the workload, not when measuring throughput.
+stats = ["kalloc/stats"]
+
+[dependencies]
+kalloc = { path = "../allocator", features = ["std"] }
+buddy_system_allocator = "0.6"
+linked_list_allocator = "0.10"
+fastrand = "2"
+spin = "0.9"
