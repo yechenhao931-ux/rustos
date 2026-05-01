@@ -60,6 +60,64 @@ impl MemorySet {
             None,
         );
     }
+    /// Lazy mmap: register a framed region with the requested permission but
+    /// don't allocate physical frames yet. The pages are faulted in on first
+    /// access by `handle_lazy_page_fault`.
+    ///
+    /// Returns Ok(()) if the whole range is non-overlapping with existing
+    /// areas; otherwise Err(()).
+    pub fn mmap(&mut self, start_va: VirtAddr, end_va: VirtAddr, perm: MapPermission) -> Result<(), ()> {
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+        // Reject overlap with any existing area.
+        for area in self.areas.iter() {
+            let s = area.vpn_range.get_start();
+            let e = area.vpn_range.get_end();
+            if !(end_vpn.0 <= s.0 || start_vpn.0 >= e.0) {
+                return Err(());
+            }
+        }
+        let mut area = MapArea::new(start_va, end_va, MapType::Framed, perm);
+        area.lazy = true;
+        // Lazy areas don't pre-populate the page table; map() is a no-op for
+        // them, see MapArea::map.
+        self.push(area, None);
+        Ok(())
+    }
+
+    /// Lazy munmap: tear down [start_va, end_va) if it exactly matches an
+    /// existing area. Returns Ok on success.
+    pub fn munmap(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> Result<(), ()> {
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+        let idx = self.areas.iter().position(|a| {
+            a.vpn_range.get_start() == start_vpn && a.vpn_range.get_end() == end_vpn
+        });
+        if let Some(i) = idx {
+            self.areas[i].unmap(&mut self.page_table);
+            self.areas.remove(i);
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+
+    /// Try to satisfy a page fault at `vpn` by faulting in a lazy page.
+    /// Returns true if a page was mapped (caller should retry the access).
+    pub fn handle_lazy_page_fault(&mut self, vpn: VirtPageNum) -> bool {
+        for area in self.areas.iter_mut() {
+            if area.lazy
+                && area.vpn_range.get_start().0 <= vpn.0
+                && vpn.0 < area.vpn_range.get_end().0
+                && !area.data_frames.contains_key(&vpn)
+            {
+                area.map_one(&mut self.page_table, vpn);
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn remove_area_with_start_vpn(&mut self, start_vpn: VirtPageNum) {
         if let Some((idx, area)) = self
             .areas
@@ -219,10 +277,24 @@ impl MemorySet {
         // copy data sections/trap_context/user_stack
         for area in user_space.areas.iter() {
             let new_area = MapArea::from_another(area);
+            // push() honors `lazy` and skips pre-mapping for lazy areas.
             memory_set.push(new_area, None);
             // copy data from another space
             for vpn in area.vpn_range {
-                let src_ppn = user_space.translate(vpn).unwrap().ppn();
+                // For lazy areas, only the pages that have actually been
+                // faulted in on the parent need to be propagated; the rest
+                // remain lazy in the child too.
+                let src_pte = match user_space.translate(vpn) {
+                    Some(pte) if pte.is_valid() => pte,
+                    _ => continue,
+                };
+                if area.lazy {
+                    // Materialize the page in the child so we can copy into it.
+                    let last_idx = memory_set.areas.len() - 1;
+                    let MemorySet { page_table, areas } = &mut memory_set;
+                    areas[last_idx].map_one(page_table, vpn);
+                }
+                let src_ppn = src_pte.ppn();
                 let dst_ppn = memory_set.translate(vpn).unwrap().ppn();
                 dst_ppn
                     .get_bytes_array()
@@ -248,10 +320,13 @@ impl MemorySet {
 }
 
 pub struct MapArea {
-    vpn_range: VPNRange,
+    pub vpn_range: VPNRange,
     data_frames: BTreeMap<VirtPageNum, FrameTracker>,
     map_type: MapType,
     map_perm: MapPermission,
+    /// If true, frames are not allocated at `map()` time but on demand by
+    /// the page-fault handler (`MemorySet::handle_lazy_page_fault`).
+    pub lazy: bool,
 }
 
 impl MapArea {
@@ -268,6 +343,7 @@ impl MapArea {
             data_frames: BTreeMap::new(),
             map_type,
             map_perm,
+            lazy: false,
         }
     }
     pub fn from_another(another: &MapArea) -> Self {
@@ -276,6 +352,7 @@ impl MapArea {
             data_frames: BTreeMap::new(),
             map_type: another.map_type,
             map_perm: another.map_perm,
+            lazy: another.lazy,
         }
     }
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
@@ -305,12 +382,22 @@ impl MapArea {
         page_table.unmap(vpn);
     }
     pub fn map(&mut self, page_table: &mut PageTable) {
+        // For lazy areas we defer per-page mapping until the first access
+        // triggers handle_lazy_page_fault.
+        if self.lazy {
+            return;
+        }
         for vpn in self.vpn_range {
             self.map_one(page_table, vpn);
         }
     }
     pub fn unmap(&mut self, page_table: &mut PageTable) {
         for vpn in self.vpn_range {
+            // Lazy pages may never have been faulted in; only unmap
+            // entries that actually exist.
+            if self.lazy && !self.data_frames.contains_key(&vpn) {
+                continue;
+            }
             self.unmap_one(page_table, vpn);
         }
     }

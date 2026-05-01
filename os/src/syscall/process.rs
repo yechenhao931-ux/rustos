@@ -1,5 +1,6 @@
+use crate::config::PAGE_SIZE;
 use crate::fs::{OpenFlags, open_file};
-use crate::mm::{translated_ref, translated_refmut, translated_str};
+use crate::mm::{MapPermission, VirtAddr, translated_ref, translated_refmut, translated_str};
 use crate::task::{
     SignalFlags, current_process, current_task, current_user_token, exit_current_and_run_next,
     pid2process, suspend_current_and_run_next,
@@ -101,6 +102,71 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
         -2
     }
     // ---- release current PCB automatically
+}
+
+/// Reserve [start, start+len) in the calling process's address space as an
+/// anonymous, demand-paged region. Frames are allocated lazily on first
+/// touch. `prot` is a bitmask of (1=R, 2=W, 4=X). Returns 0 on success, -1
+/// on bad arguments or overlap.
+pub fn sys_mmap(start: usize, len: usize, prot: usize) -> isize {
+    if start % PAGE_SIZE != 0 || len == 0 {
+        return -1;
+    }
+    // Only the low 3 bits are meaningful; reject any other bits or an
+    // empty permission set (a region nothing can touch is useless).
+    if prot & !0x7 != 0 || prot & 0x7 == 0 {
+        return -1;
+    }
+    let mut perm = MapPermission::U;
+    if prot & 0x1 != 0 {
+        perm |= MapPermission::R;
+    }
+    if prot & 0x2 != 0 {
+        perm |= MapPermission::W;
+    }
+    if prot & 0x4 != 0 {
+        perm |= MapPermission::X;
+    }
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    match inner
+        .memory_set
+        .mmap(VirtAddr::from(start), VirtAddr::from(start + len), perm)
+    {
+        Ok(()) => 0,
+        Err(()) => -1,
+    }
+}
+
+/// Release a region previously created by sys_mmap. The address range must
+/// match an existing area exactly.
+pub fn sys_munmap(start: usize, len: usize) -> isize {
+    if start % PAGE_SIZE != 0 || len == 0 {
+        return -1;
+    }
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    match inner
+        .memory_set
+        .munmap(VirtAddr::from(start), VirtAddr::from(start + len))
+    {
+        Ok(()) => 0,
+        Err(()) => -1,
+    }
+}
+
+/// Set the calling task's stride-scheduling priority.
+///
+/// `prio` must be >= 2. Returns the new priority on success, -1 on error.
+/// Larger priority => proportionally larger CPU share.
+pub fn sys_set_priority(prio: isize) -> isize {
+    if prio < 2 {
+        return -1;
+    }
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    inner.priority = prio as u64;
+    prio
 }
 
 pub fn sys_kill(pid: usize, signal: u32) -> isize {
