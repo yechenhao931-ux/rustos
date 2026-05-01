@@ -33,7 +33,16 @@ pub struct TaskControlBlockInner {
     pub task_cx: TaskContext,
     pub task_status: TaskStatus,
     pub exit_code: Option<i32>,
+    // ---- stride scheduling ----
+    /// Accumulated stride. The task with the smallest stride is picked next.
+    pub stride: u64,
+    /// Scheduling priority. Higher priority => smaller per-pick increment.
+    /// Must be >= 2.
+    pub priority: u64,
 }
+
+/// Stride scheduling constant. Per-pick increment is BIG_STRIDE / priority.
+pub const BIG_STRIDE: u64 = 1 << 20;
 
 impl TaskControlBlockInner {
     pub fn get_trap_cx(&self) -> &'static mut TrapContext {
@@ -66,6 +75,8 @@ impl TaskControlBlock {
                     task_cx: TaskContext::goto_trap_return(kstack_top),
                     task_status: TaskStatus::Ready,
                     exit_code: None,
+                    stride: 0,
+                    priority: 16,
                 })
             },
         }

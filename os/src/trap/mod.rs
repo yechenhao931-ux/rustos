@@ -2,8 +2,9 @@ mod context;
 
 use crate::config::TRAMPOLINE;
 use crate::syscall::syscall;
+use crate::mm::VirtAddr;
 use crate::task::{
-    SignalFlags, check_signals_of_current, current_add_signal, current_trap_cx,
+    SignalFlags, check_signals_of_current, current_add_signal, current_process, current_trap_cx,
     current_trap_cx_user_va, current_user_token, exit_current_and_run_next,
     suspend_current_and_run_next,
 };
@@ -77,20 +78,31 @@ pub fn trap_handler() -> ! {
             cx = current_trap_cx();
             cx.x[10] = result as usize;
         }
+        Trap::Exception(Exception::StorePageFault)
+        | Trap::Exception(Exception::LoadPageFault)
+        | Trap::Exception(Exception::InstructionPageFault) => {
+            // Resolution order:
+            //   1. lazy demand paging (mmap region not yet backed by a frame)
+            //   2. copy-on-write (PTE present but read-only after a fork)
+            //   3. real segmentation fault
+            // StorePageFault is the canonical COW trigger; LoadPageFault on
+            // a present PTE shouldn't happen in COW since reads are still
+            // permitted, but we still try in case future use cases (e.g.
+            // executable pages stripped of X) need it.
+            let vpn = VirtAddr::from(stval).floor();
+            let process = current_process();
+            let mut inner = process.inner_exclusive_access();
+            let resolved = inner.memory_set.handle_lazy_page_fault(vpn)
+                || inner.memory_set.handle_cow_fault(vpn);
+            drop(inner);
+            drop(process);
+            if !resolved {
+                current_add_signal(SignalFlags::SIGSEGV);
+            }
+        }
         Trap::Exception(Exception::StoreFault)
-        | Trap::Exception(Exception::StorePageFault)
         | Trap::Exception(Exception::InstructionFault)
-        | Trap::Exception(Exception::InstructionPageFault)
-        | Trap::Exception(Exception::LoadFault)
-        | Trap::Exception(Exception::LoadPageFault) => {
-            /*
-            println!(
-                "[kernel] {:?} in application, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it.",
-                scause.cause(),
-                stval,
-                current_trap_cx().sepc,
-            );
-            */
+        | Trap::Exception(Exception::LoadFault) => {
             current_add_signal(SignalFlags::SIGSEGV);
         }
         Trap::Exception(Exception::IllegalInstruction) => {

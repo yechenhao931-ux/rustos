@@ -11,7 +11,11 @@ const SYSCALL_EXIT: usize = 93;
 const SYSCALL_SLEEP: usize = 101;
 const SYSCALL_YIELD: usize = 124;
 const SYSCALL_KILL: usize = 129;
+const SYSCALL_SET_PRIORITY: usize = 140;
+const SYSCALL_MUNMAP: usize = 215;
+const SYSCALL_MMAP: usize = 222;
 const SYSCALL_GET_TIME: usize = 169;
+const SYSCALL_GET_TIME_US: usize = 170;
 const SYSCALL_GETPID: usize = 172;
 const SYSCALL_FORK: usize = 220;
 const SYSCALL_EXEC: usize = 221;
@@ -107,8 +111,24 @@ pub fn sys_kill(pid: usize, signal: i32) -> isize {
     syscall(SYSCALL_KILL, [pid, signal as usize, 0])
 }
 
+pub fn sys_set_priority(prio: isize) -> isize {
+    syscall(SYSCALL_SET_PRIORITY, [prio as usize, 0, 0])
+}
+
+pub fn sys_mmap(start: usize, len: usize, prot: usize) -> isize {
+    syscall(SYSCALL_MMAP, [start, len, prot])
+}
+
+pub fn sys_munmap(start: usize, len: usize) -> isize {
+    syscall(SYSCALL_MUNMAP, [start, len, 0])
+}
+
 pub fn sys_get_time() -> isize {
     syscall(SYSCALL_GET_TIME, [0, 0, 0])
+}
+
+pub fn sys_get_time_us() -> isize {
+    syscall(SYSCALL_GET_TIME_US, [0, 0, 0])
 }
 
 pub fn sys_getpid() -> isize {

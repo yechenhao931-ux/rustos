@@ -20,6 +20,13 @@ pub fn get_time_ms() -> usize {
     time::read() / (CLOCK_FREQ / MSEC_PER_SEC)
 }
 
+const USEC_PER_SEC: usize = 1_000_000;
+
+/// Microsecond-resolution wall-clock used by the benchmark suite.
+pub fn get_time_us() -> usize {
+    time::read() * USEC_PER_SEC / CLOCK_FREQ
+}
+
 pub fn set_next_trigger() {
     set_timer(get_time() + CLOCK_FREQ / TICKS_PER_SEC);
 }

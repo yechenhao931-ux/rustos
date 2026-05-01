@@ -60,6 +60,64 @@ impl MemorySet {
             None,
         );
     }
+    /// Lazy mmap: register a framed region with the requested permission but
+    /// don't allocate physical frames yet. The pages are faulted in on first
+    /// access by `handle_lazy_page_fault`.
+    ///
+    /// Returns Ok(()) if the whole range is non-overlapping with existing
+    /// areas; otherwise Err(()).
+    pub fn mmap(&mut self, start_va: VirtAddr, end_va: VirtAddr, perm: MapPermission) -> Result<(), ()> {
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+        // Reject overlap with any existing area.
+        for area in self.areas.iter() {
+            let s = area.vpn_range.get_start();
+            let e = area.vpn_range.get_end();
+            if !(end_vpn.0 <= s.0 || start_vpn.0 >= e.0) {
+                return Err(());
+            }
+        }
+        let mut area = MapArea::new(start_va, end_va, MapType::Framed, perm);
+        area.lazy = true;
+        // Lazy areas don't pre-populate the page table; map() is a no-op for
+        // them, see MapArea::map.
+        self.push(area, None);
+        Ok(())
+    }
+
+    /// Lazy munmap: tear down [start_va, end_va) if it exactly matches an
+    /// existing area. Returns Ok on success.
+    pub fn munmap(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> Result<(), ()> {
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+        let idx = self.areas.iter().position(|a| {
+            a.vpn_range.get_start() == start_vpn && a.vpn_range.get_end() == end_vpn
+        });
+        if let Some(i) = idx {
+            self.areas[i].unmap(&mut self.page_table);
+            self.areas.remove(i);
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+
+    /// Try to satisfy a page fault at `vpn` by faulting in a lazy page.
+    /// Returns true if a page was mapped (caller should retry the access).
+    pub fn handle_lazy_page_fault(&mut self, vpn: VirtPageNum) -> bool {
+        for area in self.areas.iter_mut() {
+            if area.lazy
+                && area.vpn_range.get_start().0 <= vpn.0
+                && vpn.0 < area.vpn_range.get_end().0
+                && !area.data_frames.contains_key(&vpn)
+            {
+                area.map_one(&mut self.page_table, vpn);
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn remove_area_with_start_vpn(&mut self, start_vpn: VirtPageNum) {
         if let Some((idx, area)) = self
             .areas
@@ -212,6 +270,134 @@ impl MemorySet {
             elf.header.pt2.entry_point() as usize,
         )
     }
+    // ---------------------------------------------------------------------
+    // Copy-on-Write fork.
+    //
+    // Instead of physically copying every page of the parent (the original
+    // `from_existed_user` behavior), we share frames between parent and
+    // child and clear the W bit in BOTH page tables. The first writer in
+    // either process takes a page fault and gets its own private copy via
+    // `handle_cow_fault`. Pages that are still single-owner at fault time
+    // are simply re-promoted to writable without any copy.
+    //
+    // We restrict COW sharing to user-accessible areas (those carrying
+    // `MapPermission::U`). The trap-context page is mapped without `U` and
+    // the kernel writes to it via the direct PPN access pattern, which
+    // would silently bypass any COW fault — so that page must be eagerly
+    // copied to keep parent and child contexts independent.
+    // ---------------------------------------------------------------------
+    pub fn from_existed_user_cow(user_space: &mut MemorySet) -> MemorySet {
+        let mut memory_set = Self::new_bare();
+        memory_set.map_trampoline();
+        // We index into `user_space.areas` by position so we can borrow the
+        // parent's page table mutably alongside each area.
+        for area_idx in 0..user_space.areas.len() {
+            let (start, end, perm) = {
+                let a = &user_space.areas[area_idx];
+                (a.vpn_range.get_start(), a.vpn_range.get_end(), a.map_perm)
+            };
+            let new_area = MapArea::from_another(&user_space.areas[area_idx]);
+            // Track whether this area participates in COW sharing.
+            let cow_eligible = perm.contains(MapPermission::U)
+                && user_space.areas[area_idx].map_type == MapType::Framed;
+            // Push an empty area first; we'll fill data_frames manually.
+            memory_set.areas.push(new_area);
+            let new_area_idx = memory_set.areas.len() - 1;
+
+            for vpn in VPNRange::new(start, end) {
+                let parent_pte = match user_space.page_table.translate(vpn) {
+                    Some(pte) if pte.is_valid() => pte,
+                    _ => continue, // unmapped lazy page: stay lazy in child
+                };
+
+                if cow_eligible {
+                    // Share the parent's frame Arc with the child.
+                    let arc = match user_space.areas[area_idx].data_frames.get(&vpn) {
+                        Some(a) => Arc::clone(a),
+                        None => continue,
+                    };
+                    let ppn = arc.ppn;
+                    memory_set.areas[new_area_idx].data_frames.insert(vpn, arc);
+                    // Build the read-only permission set. If the original
+                    // perm had W, drop it; the COW fault handler will
+                    // restore it (with a private copy) on first write.
+                    let ro_perm = perm - MapPermission::W;
+                    let pte_flags = PTEFlags::from_bits(ro_perm.bits).unwrap();
+                    memory_set.page_table.rewrite(vpn, ppn, pte_flags);
+                    // Demote the parent's PTE too so its writes also fault.
+                    if perm.contains(MapPermission::W) {
+                        user_space.page_table.rewrite(vpn, ppn, pte_flags);
+                    }
+                } else {
+                    // Eager copy fallback (kernel-only RW pages such as the
+                    // trap context, or anything that isn't `Framed`).
+                    let dst_ms = &mut memory_set;
+                    let last = dst_ms.areas.len() - 1;
+                    let MemorySet { page_table, areas } = dst_ms;
+                    areas[last].map_one(page_table, vpn);
+                    let dst_ppn = page_table.translate(vpn).unwrap().ppn();
+                    let src_ppn = parent_pte.ppn();
+                    dst_ppn
+                        .get_bytes_array()
+                        .copy_from_slice(src_ppn.get_bytes_array());
+                }
+            }
+        }
+        // The trap return path issues sfence.vma, but be explicit here so
+        // any kernel-side access to user pages between now and trap return
+        // sees the demoted PTEs.
+        unsafe { core::arch::asm!("sfence.vma"); }
+        memory_set
+    }
+
+    /// Handle a write/load page fault that is potentially due to COW sharing.
+    /// Returns true if the fault was a real COW fault and was resolved.
+    pub fn handle_cow_fault(&mut self, vpn: VirtPageNum) -> bool {
+        for area in self.areas.iter_mut() {
+            if !(area.vpn_range.get_start().0 <= vpn.0 && vpn.0 < area.vpn_range.get_end().0) {
+                continue;
+            }
+            // Only writable user areas can suffer a COW fault.
+            if !area.map_perm.contains(MapPermission::W)
+                || !area.map_perm.contains(MapPermission::U)
+            {
+                return false;
+            }
+            let pte = match self.page_table.translate(vpn) {
+                Some(p) if p.is_valid() => p,
+                _ => return false,
+            };
+            // If the PTE already permits writes, this isn't a COW fault.
+            if pte.writable() {
+                return false;
+            }
+            let arc = match area.data_frames.get(&vpn) {
+                Some(a) => a,
+                None => return false,
+            };
+            let pte_flags = PTEFlags::from_bits(area.map_perm.bits).unwrap();
+            if Arc::strong_count(arc) == 1 {
+                // Sole owner — no copy needed, just re-enable write.
+                let ppn = arc.ppn;
+                self.page_table.rewrite(vpn, ppn, pte_flags);
+            } else {
+                // Allocate a private copy.
+                let new_frame = frame_alloc().expect("OOM on COW copy");
+                let new_ppn = new_frame.ppn;
+                new_ppn
+                    .get_bytes_array()
+                    .copy_from_slice(arc.ppn.get_bytes_array());
+                area.data_frames.insert(vpn, Arc::new(new_frame));
+                self.page_table.rewrite(vpn, new_ppn, pte_flags);
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Eager-copy fork. Kept for benchmarking against the COW fast path
+    /// (`from_existed_user_cow`). Not used by `sys_fork` anymore.
+    #[allow(dead_code)]
     pub fn from_existed_user(user_space: &MemorySet) -> MemorySet {
         let mut memory_set = Self::new_bare();
         // map trampoline
@@ -219,10 +405,24 @@ impl MemorySet {
         // copy data sections/trap_context/user_stack
         for area in user_space.areas.iter() {
             let new_area = MapArea::from_another(area);
+            // push() honors `lazy` and skips pre-mapping for lazy areas.
             memory_set.push(new_area, None);
             // copy data from another space
             for vpn in area.vpn_range {
-                let src_ppn = user_space.translate(vpn).unwrap().ppn();
+                // For lazy areas, only the pages that have actually been
+                // faulted in on the parent need to be propagated; the rest
+                // remain lazy in the child too.
+                let src_pte = match user_space.translate(vpn) {
+                    Some(pte) if pte.is_valid() => pte,
+                    _ => continue,
+                };
+                if area.lazy {
+                    // Materialize the page in the child so we can copy into it.
+                    let last_idx = memory_set.areas.len() - 1;
+                    let MemorySet { page_table, areas } = &mut memory_set;
+                    areas[last_idx].map_one(page_table, vpn);
+                }
+                let src_ppn = src_pte.ppn();
                 let dst_ppn = memory_set.translate(vpn).unwrap().ppn();
                 dst_ppn
                     .get_bytes_array()
@@ -248,10 +448,17 @@ impl MemorySet {
 }
 
 pub struct MapArea {
-    vpn_range: VPNRange,
-    data_frames: BTreeMap<VirtPageNum, FrameTracker>,
+    pub vpn_range: VPNRange,
+    /// `Arc` so a single physical frame can be shared by multiple address
+    /// spaces (Copy-on-Write fork). The frame is dropped only when the last
+    /// `Arc` clone disappears, at which point `FrameTracker::drop` returns
+    /// the page to the buddy allocator.
+    data_frames: BTreeMap<VirtPageNum, Arc<FrameTracker>>,
     map_type: MapType,
     map_perm: MapPermission,
+    /// If true, frames are not allocated at `map()` time but on demand by
+    /// the page-fault handler (`MemorySet::handle_lazy_page_fault`).
+    pub lazy: bool,
 }
 
 impl MapArea {
@@ -268,6 +475,7 @@ impl MapArea {
             data_frames: BTreeMap::new(),
             map_type,
             map_perm,
+            lazy: false,
         }
     }
     pub fn from_another(another: &MapArea) -> Self {
@@ -276,6 +484,7 @@ impl MapArea {
             data_frames: BTreeMap::new(),
             map_type: another.map_type,
             map_perm: another.map_perm,
+            lazy: another.lazy,
         }
     }
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
@@ -287,7 +496,7 @@ impl MapArea {
             MapType::Framed => {
                 let frame = frame_alloc().unwrap();
                 ppn = frame.ppn;
-                self.data_frames.insert(vpn, frame);
+                self.data_frames.insert(vpn, Arc::new(frame));
             }
             MapType::Linear(pn_offset) => {
                 // check for sv39
@@ -305,12 +514,22 @@ impl MapArea {
         page_table.unmap(vpn);
     }
     pub fn map(&mut self, page_table: &mut PageTable) {
+        // For lazy areas we defer per-page mapping until the first access
+        // triggers handle_lazy_page_fault.
+        if self.lazy {
+            return;
+        }
         for vpn in self.vpn_range {
             self.map_one(page_table, vpn);
         }
     }
     pub fn unmap(&mut self, page_table: &mut PageTable) {
         for vpn in self.vpn_range {
+            // Lazy pages may never have been faulted in; only unmap
+            // entries that actually exist.
+            if self.lazy && !self.data_frames.contains_key(&vpn) {
+                continue;
+            }
             self.unmap_one(page_table, vpn);
         }
     }
