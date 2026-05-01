@@ -188,8 +188,11 @@ impl ProcessControlBlock {
     pub fn fork(self: &Arc<Self>) -> Arc<Self> {
         let mut parent = self.inner_exclusive_access();
         assert_eq!(parent.thread_count(), 1);
-        // clone parent's memory_set completely including trampoline/ustacks/trap_cxs
-        let memory_set = MemorySet::from_existed_user(&parent.memory_set);
+        // Copy-on-Write: share user pages with the parent and let the COW
+        // fault handler clone individual pages on first write. This makes
+        // fork() O(num_pages_in_page_table) instead of O(total_resident_bytes)
+        // and avoids touching pages the child never modifies (e.g. text).
+        let memory_set = MemorySet::from_existed_user_cow(&mut parent.memory_set);
         // alloc a pid
         let pid = pid_alloc();
         // copy fd table

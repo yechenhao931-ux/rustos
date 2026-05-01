@@ -5,7 +5,7 @@ use crate::task::{
     SignalFlags, current_process, current_task, current_user_token, exit_current_and_run_next,
     pid2process, suspend_current_and_run_next,
 };
-use crate::timer::get_time_ms;
+use crate::timer::{get_time_ms, get_time_us};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -22,6 +22,12 @@ pub fn sys_yield() -> isize {
 
 pub fn sys_get_time() -> isize {
     get_time_ms() as isize
+}
+
+/// Microsecond-resolution wall clock, used by the benchmark suite to
+/// measure short kernel paths (fork, mmap, scheduler quantum).
+pub fn sys_get_time_us() -> isize {
+    get_time_us() as isize
 }
 
 pub fn sys_getpid() -> isize {

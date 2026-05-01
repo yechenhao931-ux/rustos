@@ -124,6 +124,14 @@ impl PageTable {
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.find_pte(vpn).map(|pte| *pte)
     }
+    /// Rewrite the leaf PTE for `vpn` with `(ppn, flags|V)`. Used by the
+    /// COW path to (a) demote an existing PTE to read-only at fork time and
+    /// (b) re-promote it on a write fault. Caller is responsible for any
+    /// required `sfence.vma` (the trap entry/exit path already issues one).
+    pub fn rewrite(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) {
+        let pte = self.find_pte_create(vpn).unwrap();
+        *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
+    }
     pub fn translate_va(&self, va: VirtAddr) -> Option<PhysAddr> {
         self.find_pte(va.clone().floor()).map(|pte| {
             let aligned_pa: PhysAddr = pte.ppn().into();

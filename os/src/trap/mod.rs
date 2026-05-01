@@ -81,15 +81,22 @@ pub fn trap_handler() -> ! {
         Trap::Exception(Exception::StorePageFault)
         | Trap::Exception(Exception::LoadPageFault)
         | Trap::Exception(Exception::InstructionPageFault) => {
-            // Try lazy demand paging first: if `stval` falls inside a lazy
-            // mmap region, fault in the page and resume the user
-            // instruction. Anything else is a real segmentation fault.
+            // Resolution order:
+            //   1. lazy demand paging (mmap region not yet backed by a frame)
+            //   2. copy-on-write (PTE present but read-only after a fork)
+            //   3. real segmentation fault
+            // StorePageFault is the canonical COW trigger; LoadPageFault on
+            // a present PTE shouldn't happen in COW since reads are still
+            // permitted, but we still try in case future use cases (e.g.
+            // executable pages stripped of X) need it.
             let vpn = VirtAddr::from(stval).floor();
             let process = current_process();
             let mut inner = process.inner_exclusive_access();
-            if !inner.memory_set.handle_lazy_page_fault(vpn) {
-                drop(inner);
-                drop(process);
+            let resolved = inner.memory_set.handle_lazy_page_fault(vpn)
+                || inner.memory_set.handle_cow_fault(vpn);
+            drop(inner);
+            drop(process);
+            if !resolved {
                 current_add_signal(SignalFlags::SIGSEGV);
             }
         }

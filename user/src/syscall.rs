@@ -15,6 +15,7 @@ const SYSCALL_SET_PRIORITY: usize = 140;
 const SYSCALL_MUNMAP: usize = 215;
 const SYSCALL_MMAP: usize = 222;
 const SYSCALL_GET_TIME: usize = 169;
+const SYSCALL_GET_TIME_US: usize = 170;
 const SYSCALL_GETPID: usize = 172;
 const SYSCALL_FORK: usize = 220;
 const SYSCALL_EXEC: usize = 221;
@@ -124,6 +125,10 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
 
 pub fn sys_get_time() -> isize {
     syscall(SYSCALL_GET_TIME, [0, 0, 0])
+}
+
+pub fn sys_get_time_us() -> isize {
+    syscall(SYSCALL_GET_TIME_US, [0, 0, 0])
 }
 
 pub fn sys_getpid() -> isize {
