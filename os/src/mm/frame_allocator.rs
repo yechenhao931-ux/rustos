@@ -159,6 +159,11 @@ impl FrameAllocator for BuddyFrameAllocator {
     /// back to the buddy free lists. Each returned frame is freed
     /// independently via `FrameTracker::drop`, and the buddy coalescer
     /// rebuilds the larger block once all of them are released.
+    ///
+    /// The returned `Vec` is in **decreasing** PPN order to match the
+    /// original `StackFrameAllocator` contract: `vec.last()` therefore
+    /// gives the lowest PPN, i.e. the *base* of the contiguous range.
+    /// `drivers/bus/virtio.rs::dma_alloc` relies on this.
     fn alloc_more(&mut self, pages: usize) -> Option<Vec<PhysPageNum>> {
         if pages == 0 {
             return Some(Vec::new());
@@ -170,7 +175,12 @@ impl FrameAllocator for BuddyFrameAllocator {
         if used_end < block_end {
             self.add_block(used_end, block_end - used_end);
         }
-        Some((start..used_end).map(PhysPageNum::from).collect())
+        Some(
+            (start..used_end)
+                .rev()
+                .map(PhysPageNum::from)
+                .collect(),
+        )
     }
 
     fn dealloc(&mut self, ppn: PhysPageNum) {
