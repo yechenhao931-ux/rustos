@@ -200,7 +200,127 @@ fn ceil_log2(n: usize) -> usize {
     }
 }
 
-type FrameAllocatorImpl = BuddyFrameAllocator;
+// =============================================================================
+// Two-tier hybrid allocator
+// -----------------------------------------------------------------------------
+// Combines the strengths of the legacy stack allocator (O(1) hot path) and
+// the buddy allocator (anti-fragmentation, contiguous multi-page allocs).
+//
+//   L1 (cache) : a small LIFO stack of free single-page PPNs. Pop on alloc,
+//                push on dealloc — both branch-free, no buddy bookkeeping.
+//   L2 (back)  : the BuddyFrameAllocator manages the entire arena and
+//                handles refills, drains, and all multi-page allocations.
+//
+// On L1 miss, refill_one() asks L2 for one contiguous block of
+// 2^ceil_log2(CACHE_REFILL) pages with a single alloc_order call (so the
+// log-N split cost is paid once per CACHE_REFILL allocations, not once per
+// page). The first page is returned; the rest are pushed into L1.
+//
+// On L1 overflow (cache.len() >= CACHE_HIGH), drain_to_low() shovels
+// (HIGH - LOW) oldest pages back into L2 via dealloc_order(_, 0). Buddy
+// then coalesces them with their physical neighbors so future contiguous
+// requests still succeed.
+//
+// Multi-page (alloc_more) bypasses L1 and goes straight to L2 because only
+// the buddy can guarantee physical contiguity. If L2 fails, we drain L1
+// completely and retry — pages parked in L1 may be physically adjacent to
+// the gap that prevented the multi-page alloc from succeeding.
+// =============================================================================
+
+pub struct HybridFrameAllocator {
+    cache: Vec<usize>,
+    backing: BuddyFrameAllocator,
+}
+
+impl HybridFrameAllocator {
+    /// Pages pulled from L2 per refill (and thus the maximum chunk we hold
+    /// contiguous in the cache after a single miss).
+    const CACHE_REFILL: usize = 16;
+    /// Cache size at which we trigger a drain.
+    const CACHE_HIGH: usize = 64;
+    /// Cache size we drain down to.
+    const CACHE_LOW: usize = 16;
+
+    pub fn init(&mut self, l: PhysPageNum, r: PhysPageNum) {
+        self.backing.init(l, r);
+    }
+
+    fn refill_one(&mut self) -> Option<usize> {
+        // Walk the order ladder downwards: prefer one big contiguous chunk
+        // (amortizes split cost), fall back to progressively smaller blocks
+        // if the buddy is fragmented.
+        let mut order = ceil_log2(Self::CACHE_REFILL);
+        loop {
+            if let Some(start) = self.backing.alloc_order(order) {
+                let block = 1usize << order;
+                for i in (1..block).rev() {
+                    self.cache.push(start + i);
+                }
+                return Some(start);
+            }
+            if order == 0 {
+                return None;
+            }
+            order -= 1;
+        }
+    }
+
+    fn drain_to_low(&mut self) {
+        if self.cache.len() <= Self::CACHE_LOW {
+            return;
+        }
+        let n = self.cache.len() - Self::CACHE_LOW;
+        // Drain from the FRONT (oldest pages); the hottest entries stay
+        // near the top of the stack for the next pop().
+        let drained: Vec<usize> = self.cache.drain(0..n).collect();
+        for p in drained {
+            self.backing.dealloc_order(p, 0);
+        }
+    }
+
+    fn drain_all(&mut self) {
+        let drained: Vec<usize> = self.cache.drain(..).collect();
+        for p in drained {
+            self.backing.dealloc_order(p, 0);
+        }
+    }
+}
+
+impl FrameAllocator for HybridFrameAllocator {
+    fn new() -> Self {
+        Self {
+            cache: Vec::with_capacity(Self::CACHE_HIGH),
+            backing: BuddyFrameAllocator::new(),
+        }
+    }
+
+    fn alloc(&mut self) -> Option<PhysPageNum> {
+        if let Some(p) = self.cache.pop() {
+            Some(p.into())
+        } else {
+            self.refill_one().map(PhysPageNum::from)
+        }
+    }
+
+    fn alloc_more(&mut self, pages: usize) -> Option<Vec<PhysPageNum>> {
+        if let Some(v) = self.backing.alloc_more(pages) {
+            return Some(v);
+        }
+        // L2 is too fragmented even though L1 might be hoarding adjacent
+        // pages. Flush L1 and retry once.
+        self.drain_all();
+        self.backing.alloc_more(pages)
+    }
+
+    fn dealloc(&mut self, ppn: PhysPageNum) {
+        self.cache.push(ppn.0);
+        if self.cache.len() >= Self::CACHE_HIGH {
+            self.drain_to_low();
+        }
+    }
+}
+
+type FrameAllocatorImpl = HybridFrameAllocator;
 
 lazy_static! {
     pub static ref FRAME_ALLOCATOR: UPIntrFreeCell<FrameAllocatorImpl> =
@@ -325,6 +445,52 @@ impl LegacyStackFrameAllocator {
     }
 }
 
+/// Tiny enum so each workload below can dispatch identically over all three
+/// allocators. We avoid a dyn-trait object because the FrameAllocator trait
+/// is private to this module and we don't want to widen it just for the
+/// bench.
+enum Tier {
+    Stack(LegacyStackFrameAllocator),
+    Buddy(BuddyFrameAllocator),
+    Hybrid(HybridFrameAllocator),
+}
+impl Tier {
+    fn build_stack(base: usize, end: usize) -> Self {
+        Tier::Stack(LegacyStackFrameAllocator::new(base, end))
+    }
+    fn build_buddy(base: usize, end: usize) -> Self {
+        let mut a = BuddyFrameAllocator::new();
+        a.init(PhysPageNum::from(base), PhysPageNum::from(end));
+        Tier::Buddy(a)
+    }
+    fn build_hybrid(base: usize, end: usize) -> Self {
+        let mut a = HybridFrameAllocator::new();
+        a.init(PhysPageNum::from(base), PhysPageNum::from(end));
+        Tier::Hybrid(a)
+    }
+    fn alloc(&mut self) -> Option<PhysPageNum> {
+        match self {
+            Tier::Stack(a) => a.alloc(),
+            Tier::Buddy(a) => a.alloc(),
+            Tier::Hybrid(a) => a.alloc(),
+        }
+    }
+    fn alloc_more(&mut self, n: usize) -> Option<Vec<PhysPageNum>> {
+        match self {
+            Tier::Stack(a) => a.alloc_more(n),
+            Tier::Buddy(a) => a.alloc_more(n),
+            Tier::Hybrid(a) => a.alloc_more(n),
+        }
+    }
+    fn dealloc(&mut self, p: PhysPageNum) {
+        match self {
+            Tier::Stack(a) => a.dealloc(p),
+            Tier::Buddy(a) => a.dealloc(p),
+            Tier::Hybrid(a) => a.dealloc(p),
+        }
+    }
+}
+
 pub fn run_buddy_bench() {
     use crate::timer::get_time_us;
     const ARENA: usize = 256;
@@ -344,95 +510,77 @@ pub fn run_buddy_bench() {
         base, end, ARENA
     );
 
+    let labels = ["stack ", "buddy ", "hybrid"];
+    let builders: [fn(usize, usize) -> Tier; 3] = [
+        Tier::build_stack,
+        Tier::build_buddy,
+        Tier::build_hybrid,
+    ];
+
     // ---- Workload A: alloc/dealloc throughput on order-0 pages ----
-    let (b_alloc_us, b_dealloc_us) = {
-        let mut a = BuddyFrameAllocator::new();
-        a.init(PhysPageNum::from(base), PhysPageNum::from(end));
-        let mut v: Vec<PhysPageNum> = Vec::with_capacity(ARENA);
-        let t0 = get_time_us();
-        for _ in 0..ARENA {
-            v.push(a.alloc().expect("buddy: arena exhausted"));
-        }
-        let t1 = get_time_us();
-        for p in v.drain(..) {
-            a.dealloc(p);
-        }
-        let t2 = get_time_us();
-        (t1 - t0, t2 - t1)
-    };
-    let (s_alloc_us, s_dealloc_us) = {
-        let mut a = LegacyStackFrameAllocator::new(base, end);
-        let mut v: Vec<PhysPageNum> = Vec::with_capacity(ARENA);
-        let t0 = get_time_us();
-        for _ in 0..ARENA {
-            v.push(a.alloc().expect("stack: arena exhausted"));
-        }
-        let t1 = get_time_us();
-        for p in v.drain(..) {
-            a.dealloc(p);
-        }
-        let t2 = get_time_us();
-        (t1 - t0, t2 - t1)
-    };
     println!(
         "[buddy_bench] === Workload A: alloc + dealloc {} order-0 pages ===",
         ARENA
     );
-    println!(
-        "[buddy_bench]   buddy : alloc {} us, dealloc {} us",
-        b_alloc_us, b_dealloc_us
-    );
-    println!(
-        "[buddy_bench]   stack : alloc {} us, dealloc {} us",
-        s_alloc_us, s_dealloc_us
-    );
-
-    // ---- Workload B: contiguous-K alloc after full churn ----
-    // Alloc the entire arena, free everything, then ask for a K-page
-    // contiguous block. Buddy coalesces freed pages back into large blocks.
-    // The legacy stack allocator never inspects its `recycled` stack from
-    // alloc_more, so it fails as soon as the bump pointer is exhausted.
-    println!("[buddy_bench] === Workload B: alloc_more(K) after full churn ===");
-    let ks: [usize; 4] = [2, 4, 8, 32];
-    for &k in &ks {
-        let buddy_ok = {
-            let mut a = BuddyFrameAllocator::new();
-            a.init(PhysPageNum::from(base), PhysPageNum::from(end));
-            let mut v: Vec<PhysPageNum> = (0..ARENA).map(|_| a.alloc().unwrap()).collect();
-            for p in v.drain(..) {
-                a.dealloc(p);
-            }
-            a.alloc_more(k).is_some()
-        };
-        let stack_ok = {
-            let mut a = LegacyStackFrameAllocator::new(base, end);
-            let mut v: Vec<PhysPageNum> = (0..ARENA).map(|_| a.alloc().unwrap()).collect();
-            for p in v.drain(..) {
-                a.dealloc(p);
-            }
-            a.alloc_more(k).is_some()
-        };
+    for (label, build) in labels.iter().zip(builders.iter()) {
+        let mut a = build(base, end);
+        let mut v: Vec<PhysPageNum> = Vec::with_capacity(ARENA);
+        let t0 = get_time_us();
+        for _ in 0..ARENA {
+            v.push(a.alloc().expect("arena exhausted"));
+        }
+        let t1 = get_time_us();
+        for p in v.drain(..) {
+            a.dealloc(p);
+        }
+        let t2 = get_time_us();
         println!(
-            "[buddy_bench]   alloc_more({:>2}): buddy={:<4} stack={:<4}",
-            k,
-            if buddy_ok { "OK" } else { "FAIL" },
-            if stack_ok { "OK" } else { "FAIL" },
+            "[buddy_bench]   {} : alloc {:>4} us, dealloc {:>4} us",
+            label,
+            t1 - t0,
+            t2 - t1
         );
     }
 
-    // ---- Workload C: alloc/dealloc churn (mixed) ----
-    // Repeated: alloc 64 pages, free a pseudo-random 32 of them, back-fill,
-    // measuring time. Same workload on both allocators.
+    // ---- Workload B: contiguous-K alloc after full churn ----
+    // Alloc the entire arena, free everything, then ask for a K-page
+    // contiguous block. Buddy/hybrid coalesce freed pages back into large
+    // blocks. Legacy stack `alloc_more` never inspects its `recycled`
+    // stack, so it fails as soon as the bump pointer is exhausted.
+    println!("[buddy_bench] === Workload B: alloc_more(K) after full churn ===");
+    let ks: [usize; 4] = [2, 4, 8, 32];
+    for &k in &ks {
+        let mut row = [false; 3];
+        for (i, build) in builders.iter().enumerate() {
+            let mut a = build(base, end);
+            let mut v: Vec<PhysPageNum> = (0..ARENA).map(|_| a.alloc().unwrap()).collect();
+            for p in v.drain(..) {
+                a.dealloc(p);
+            }
+            row[i] = a.alloc_more(k).is_some();
+        }
+        println!(
+            "[buddy_bench]   alloc_more({:>2}): stack={:<4} buddy={:<4} hybrid={:<4}",
+            k,
+            if row[0] { "OK" } else { "FAIL" },
+            if row[1] { "OK" } else { "FAIL" },
+            if row[2] { "OK" } else { "FAIL" },
+        );
+    }
+
+    // ---- Workload C: mixed churn (single-page hot path, 1024 iters) ----
+    // Each iteration does dealloc + alloc on a 64-page working set.
+    // Hybrid should approach stack speed because most ops hit L1 and
+    // never touch buddy's free lists.
     println!("[buddy_bench] === Workload C: 1024-iter mixed churn (64-page working set) ===");
     const ITER: usize = 1024;
-    let buddy_us = {
-        let mut a = BuddyFrameAllocator::new();
-        a.init(PhysPageNum::from(base), PhysPageNum::from(end));
+    for (label, build) in labels.iter().zip(builders.iter()) {
+        let mut a = build(base, end);
         let mut held: Vec<PhysPageNum> = (0..64).map(|_| a.alloc().unwrap()).collect();
         let t0 = get_time_us();
         for i in 0..ITER {
             // pseudo-random index = (i * 1664525 + 1013904223) % 64
-            let j = ((i.wrapping_mul(1664525).wrapping_add(1013904223)) % 64) as usize;
+            let j = (i.wrapping_mul(1664525).wrapping_add(1013904223)) % 64;
             let old = held[j];
             a.dealloc(old);
             held[j] = a.alloc().unwrap();
@@ -441,37 +589,15 @@ pub fn run_buddy_bench() {
         for p in held.drain(..) {
             a.dealloc(p);
         }
-        t1 - t0
-    };
-    let stack_us = {
-        let mut a = LegacyStackFrameAllocator::new(base, end);
-        let mut held: Vec<PhysPageNum> = (0..64).map(|_| a.alloc().unwrap()).collect();
-        let t0 = get_time_us();
-        for i in 0..ITER {
-            let j = ((i.wrapping_mul(1664525).wrapping_add(1013904223)) % 64) as usize;
-            let old = held[j];
-            a.dealloc(old);
-            held[j] = a.alloc().unwrap();
-        }
-        let t1 = get_time_us();
-        for p in held.drain(..) {
-            a.dealloc(p);
-        }
-        t1 - t0
-    };
-    let ops = (ITER * 2) as usize;
-    println!(
-        "[buddy_bench]   buddy : {} us total ({} ns/op avg over {} ops)",
-        buddy_us,
-        if buddy_us > 0 { (buddy_us * 1000) / ops } else { 0 },
-        ops
-    );
-    println!(
-        "[buddy_bench]   stack : {} us total ({} ns/op avg over {} ops)",
-        stack_us,
-        if stack_us > 0 { (stack_us * 1000) / ops } else { 0 },
-        ops
-    );
+        let ops = ITER * 2;
+        println!(
+            "[buddy_bench]   {} : {:>5} us total ({:>3} ns/op avg over {} ops)",
+            label,
+            t1 - t0,
+            if t1 > t0 { ((t1 - t0) * 1000) / ops } else { 0 },
+            ops
+        );
+    }
 
     // arena drops here, returning the test pages to the live allocator.
     drop(arena);

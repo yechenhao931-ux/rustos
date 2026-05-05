@@ -30,7 +30,7 @@ stride growth ⇒ more frequent selection.
 `sys_set_priority(prio)` (syscall 140) lets a task tune its own share at
 runtime; values `< 2` are rejected to avoid divide-by-tiny.
 
-### 1.2 Buddy frame allocator
+### 1.2 Buddy frame allocator (the L2 backing store)
 
 Replaces the bump+`recycled: Vec` allocator. `free_lists[k]` is a
 `BTreeSet<usize>` of starting PPNs of free blocks of size 2ᵏ pages.
@@ -45,7 +45,51 @@ Replaces the bump+`recycled: Vec` allocator. `free_lists[k]` is a
 * **alloc_more(n)** allocates a single block of order `⌈log₂ n⌉` and
   releases the unused tail back to the free lists, so multi-page virtio
   buffers stay physically contiguous *after* per-page deallocs and
-  reallocs.
+  reallocs. Returns PPNs in **decreasing** order so `vec.last()` is the
+  base of the contiguous range — the contract `dma_alloc` relies on.
+
+### 1.2b Hybrid L1+L2 allocator (the LIVE allocator)
+
+The buddy allocator is correct but pays a `log N` split/merge cost on
+*every* single-page op, even though most kernel allocations are
+short-lived single pages. We wrap it in a per-allocator stack cache
+inspired by Linux's per-CPU page lists (PCP) / page-color caches:
+
+```
+                  ┌─────────────────────────────────────────┐
+  frame_alloc ──▶ │  L1: Vec<usize>   (LIFO stack of PPNs)  │
+                  │  hot path: pop / push, branch-free      │
+                  └─────────────┬───────────────────────────┘
+                                │ miss → refill 16 pages
+                                │ overflow → drain back to LOW
+                                ▼
+                  ┌─────────────────────────────────────────┐
+                  │  L2: BuddyFrameAllocator                │
+                  │  serves all alloc_more, all refills,    │
+                  │  coalesces returned pages               │
+                  └─────────────────────────────────────────┘
+```
+
+* **alloc()** pops from L1; on miss calls `refill_one()` which asks L2
+  for a `2^⌈log₂ 16⌉ = 16`-page contiguous block via a single
+  `alloc_order` call, returns the first page to the caller, and pushes
+  the other 15 into L1. Amortized: 1 buddy op per 16 user allocs.
+  Walks the order ladder downwards if L2 is fragmented.
+* **dealloc(p)** pushes onto L1; if `cache.len() ≥ CACHE_HIGH (64)`,
+  drains the oldest `CACHE_HIGH − CACHE_LOW = 48` entries back into L2
+  with `dealloc_order(_, 0)`, where buddy can re-merge them with their
+  physical neighbors. Hot pages stay near the top of the stack.
+* **alloc_more(n)** *bypasses* L1 and goes directly to L2 because only
+  the buddy can guarantee physical contiguity. If L2 fails (rare, only
+  when very fragmented), the cache is drained in full and L2 is asked
+  again — pages parked in L1 may have been adjacent to the gap that
+  prevented contiguous allocation.
+
+This composition gives:
+  * single-page hot path ≈ stack speed (one branch + Vec pop),
+  * multi-page allocations ≈ buddy speed,
+  * fragmentation resistance ≈ buddy (drain ensures L1 doesn't
+    permanently sequester pages buddy needs).
 
 ### 1.3 mmap with demand paging
 
@@ -153,40 +197,46 @@ wall clock; for relative measurements (latency, ratios) this is fine.
   involvement). The ratio `first_touch_us / retouch_us` shows how
   expensive a page fault is relative to a hot store.
 
-#### `buddy_bench` — μs/op + contiguous-after-churn
+#### `buddy_bench` — 3-way μs/op + contiguous-after-churn
 
 Userland can't call `frame_alloc` directly, so this bench runs entirely
 inside the kernel (syscall 2500). The kernel:
 
-1. Leases a 256-page contiguous arena from the live buddy allocator.
-2. For each workload below, builds a **fresh local allocator** of each
-   kind over that same arena and runs the same operation sequence:
-   * `BuddyFrameAllocator` — the new implementation.
-   * `LegacyStackFrameAllocator` — the original rCore allocator,
-     compiled in only for this benchmark (`#[allow(dead_code)]`).
+1. Leases a 256-page contiguous arena from the **live** allocator
+   (which is `HybridFrameAllocator`).
+2. For each workload below, builds a **fresh local allocator** of
+   each kind over that same arena and runs the same operation
+   sequence:
+   * `LegacyStackFrameAllocator` — original rCore baseline.
+   * `BuddyFrameAllocator` — anti-fragmentation tier in isolation.
+   * `HybridFrameAllocator` — the production composition (L1+L2).
 3. Prints microsecond timings via `timer::get_time_us`.
+
+The bench uses a small `Tier` enum to dispatch identically across the
+three allocators without widening the private `FrameAllocator` trait.
 
 Workloads:
 
-* **A — throughput.** Alloc all 256 order-0 pages, dealloc all. Both
-  allocators are O(N), but the buddy carries log-N split/merge
-  overhead per op while the stack is amortized O(1). Expect the stack
-  to be 2–5× faster on this micro-benchmark; this is the **cost** you
-  pay for buddy.
+* **A — throughput.** Alloc all 256 order-0 pages, dealloc all.
+  * Stack: amortized O(1), fastest.
+  * Buddy: log-N split/merge per op, slowest.
+  * Hybrid: 1 refill (log-N) per 16 user allocs, plus a drain when
+    the dealloc stream overflows. Expected to land **closer to stack
+    than to buddy** — this is the whole point of the L1 cache.
 
 * **B — contiguous-after-churn.** Alloc all 256 pages, free all 256,
   then `alloc_more(K)` for K ∈ {2, 4, 8, 32}.
-  * Buddy: every `K` succeeds — freed pages coalesce back into large
-    blocks.
-  * Legacy stack: every `K` **FAILs** — `alloc_more` only consults the
-    bump pointer (`current..end`), never the recycled stack, so once
-    the bump pointer is exhausted contiguous allocation is dead. This
-    is the **headline win** for buddy and the qualitative
-    correctness/fragmentation difference to point to in an interview.
+  * Stack: every `K` **FAILs** — `alloc_more` only consults the bump
+    pointer, never the recycled stack.
+  * Buddy: every `K` succeeds — coalescer rebuilds large blocks.
+  * Hybrid: every `K` succeeds — `alloc_more` bypasses L1 and goes
+    straight to L2; the L1 drain on retry guarantees no page is
+    sequestered out of buddy's reach.
 
 * **C — mixed churn.** 1024 pseudo-random alloc/dealloc pairs over a
-  64-page working set. Reports total μs and ns/op average; mirrors a
-  realistic kernel hot path.
+  64-page working set. Mirrors a realistic kernel hot path. Hybrid
+  should approach stack speed because the working set fits inside the
+  cache window.
 
 Run via `> buddy_bench` in the rCore shell. The arena is freed when
 the bench returns, so the test is non-destructive and can be re-run.
