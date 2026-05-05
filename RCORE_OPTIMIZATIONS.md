@@ -83,6 +83,7 @@ Programs live in `user/src/bin/`:
 | `fork_bench.rs` | COW fork latency | μs/fork vs resident-set size |
 | `mmap_bench.rs` | demand paging | mmap μs, first-touch μs/page, retouch μs |
 | `stride_bench.rs` | scheduler fairness | work_hi / work_lo vs P_hi / P_lo |
+| `buddy_bench.rs` | frame allocator (kernel-side) | μs/op + contiguous-after-churn success matrix |
 
 A microsecond timer (`sys_get_time_us`, syscall 170) was added because
 `sys_get_time` only returns milliseconds, which is too coarse for fork and
@@ -151,6 +152,44 @@ wall clock; for relative measurements (latency, ratios) this is fine.
 * `retouch_us` is the user-mode store throughput baseline (no kernel
   involvement). The ratio `first_touch_us / retouch_us` shows how
   expensive a page fault is relative to a hot store.
+
+#### `buddy_bench` — μs/op + contiguous-after-churn
+
+Userland can't call `frame_alloc` directly, so this bench runs entirely
+inside the kernel (syscall 2500). The kernel:
+
+1. Leases a 256-page contiguous arena from the live buddy allocator.
+2. For each workload below, builds a **fresh local allocator** of each
+   kind over that same arena and runs the same operation sequence:
+   * `BuddyFrameAllocator` — the new implementation.
+   * `LegacyStackFrameAllocator` — the original rCore allocator,
+     compiled in only for this benchmark (`#[allow(dead_code)]`).
+3. Prints microsecond timings via `timer::get_time_us`.
+
+Workloads:
+
+* **A — throughput.** Alloc all 256 order-0 pages, dealloc all. Both
+  allocators are O(N), but the buddy carries log-N split/merge
+  overhead per op while the stack is amortized O(1). Expect the stack
+  to be 2–5× faster on this micro-benchmark; this is the **cost** you
+  pay for buddy.
+
+* **B — contiguous-after-churn.** Alloc all 256 pages, free all 256,
+  then `alloc_more(K)` for K ∈ {2, 4, 8, 32}.
+  * Buddy: every `K` succeeds — freed pages coalesce back into large
+    blocks.
+  * Legacy stack: every `K` **FAILs** — `alloc_more` only consults the
+    bump pointer (`current..end`), never the recycled stack, so once
+    the bump pointer is exhausted contiguous allocation is dead. This
+    is the **headline win** for buddy and the qualitative
+    correctness/fragmentation difference to point to in an interview.
+
+* **C — mixed churn.** 1024 pseudo-random alloc/dealloc pairs over a
+  64-page working set. Reports total μs and ns/op average; mirrors a
+  realistic kernel hot path.
+
+Run via `> buddy_bench` in the rCore shell. The arena is freed when
+the bench returns, so the test is non-destructive and can be re-run.
 
 #### `stride_bench` — `work` ratio per priority pair
 

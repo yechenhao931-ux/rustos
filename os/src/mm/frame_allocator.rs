@@ -269,3 +269,211 @@ pub fn frame_allocator_alloc_more_test() {
     drop(v);
     println!("frame_allocator_test passed!");
 }
+
+// =============================================================================
+// In-kernel benchmark for the frame allocator.
+//
+// Userland can't time `frame_alloc` directly (no syscall) and `mmap_bench`
+// measures the *whole* page-fault path. This bench isolates the allocator:
+// it leases an arena of ARENA contiguous pages from the live buddy
+// allocator, then runs identical workloads against
+//   (a) a fresh BuddyFrameAllocator initialized over the arena,
+//   (b) a fresh LegacyStackFrameAllocator (the original rCore allocator,
+//        revived here only for comparison).
+// Both run inside the kernel and print microseconds via timer::get_time_us.
+//
+// The arena is freed when the bench returns (the FrameTrackers drop), so
+// this is non-destructive and can be invoked repeatedly.
+// =============================================================================
+
+#[allow(dead_code)]
+struct LegacyStackFrameAllocator {
+    current: usize,
+    end: usize,
+    recycled: Vec<usize>,
+}
+
+#[allow(dead_code)]
+impl LegacyStackFrameAllocator {
+    fn new(l: usize, r: usize) -> Self {
+        Self { current: l, end: r, recycled: Vec::new() }
+    }
+    fn alloc(&mut self) -> Option<PhysPageNum> {
+        if let Some(ppn) = self.recycled.pop() {
+            Some(ppn.into())
+        } else if self.current == self.end {
+            None
+        } else {
+            self.current += 1;
+            Some((self.current - 1).into())
+        }
+    }
+    fn alloc_more(&mut self, pages: usize) -> Option<Vec<PhysPageNum>> {
+        // Original rCore behavior: only the bump-pointer region is consulted;
+        // recycled pages are never coalesced into multi-page allocations.
+        if self.current + pages >= self.end {
+            None
+        } else {
+            self.current += pages;
+            let arr: Vec<usize> = (1..pages + 1).collect();
+            let v = arr.iter().map(|x| (self.current - x).into()).collect();
+            Some(v)
+        }
+    }
+    fn dealloc(&mut self, ppn: PhysPageNum) {
+        self.recycled.push(ppn.0);
+    }
+}
+
+pub fn run_buddy_bench() {
+    use crate::timer::get_time_us;
+    const ARENA: usize = 256;
+
+    let arena = match frame_alloc_more(ARENA) {
+        Some(v) => v,
+        None => {
+            println!("[buddy_bench] OOM acquiring {}-page arena", ARENA);
+            return;
+        }
+    };
+    // alloc_more returns ppns in decreasing order; the base is `last()`.
+    let base = arena.last().unwrap().ppn.0;
+    let end = base + ARENA;
+    println!(
+        "[buddy_bench] arena: base_ppn={:#x} end_ppn={:#x} pages={}",
+        base, end, ARENA
+    );
+
+    // ---- Workload A: alloc/dealloc throughput on order-0 pages ----
+    let (b_alloc_us, b_dealloc_us) = {
+        let mut a = BuddyFrameAllocator::new();
+        a.init(PhysPageNum::from(base), PhysPageNum::from(end));
+        let mut v: Vec<PhysPageNum> = Vec::with_capacity(ARENA);
+        let t0 = get_time_us();
+        for _ in 0..ARENA {
+            v.push(a.alloc().expect("buddy: arena exhausted"));
+        }
+        let t1 = get_time_us();
+        for p in v.drain(..) {
+            a.dealloc(p);
+        }
+        let t2 = get_time_us();
+        (t1 - t0, t2 - t1)
+    };
+    let (s_alloc_us, s_dealloc_us) = {
+        let mut a = LegacyStackFrameAllocator::new(base, end);
+        let mut v: Vec<PhysPageNum> = Vec::with_capacity(ARENA);
+        let t0 = get_time_us();
+        for _ in 0..ARENA {
+            v.push(a.alloc().expect("stack: arena exhausted"));
+        }
+        let t1 = get_time_us();
+        for p in v.drain(..) {
+            a.dealloc(p);
+        }
+        let t2 = get_time_us();
+        (t1 - t0, t2 - t1)
+    };
+    println!(
+        "[buddy_bench] === Workload A: alloc + dealloc {} order-0 pages ===",
+        ARENA
+    );
+    println!(
+        "[buddy_bench]   buddy : alloc {} us, dealloc {} us",
+        b_alloc_us, b_dealloc_us
+    );
+    println!(
+        "[buddy_bench]   stack : alloc {} us, dealloc {} us",
+        s_alloc_us, s_dealloc_us
+    );
+
+    // ---- Workload B: contiguous-K alloc after full churn ----
+    // Alloc the entire arena, free everything, then ask for a K-page
+    // contiguous block. Buddy coalesces freed pages back into large blocks.
+    // The legacy stack allocator never inspects its `recycled` stack from
+    // alloc_more, so it fails as soon as the bump pointer is exhausted.
+    println!("[buddy_bench] === Workload B: alloc_more(K) after full churn ===");
+    let ks: [usize; 4] = [2, 4, 8, 32];
+    for &k in &ks {
+        let buddy_ok = {
+            let mut a = BuddyFrameAllocator::new();
+            a.init(PhysPageNum::from(base), PhysPageNum::from(end));
+            let mut v: Vec<PhysPageNum> = (0..ARENA).map(|_| a.alloc().unwrap()).collect();
+            for p in v.drain(..) {
+                a.dealloc(p);
+            }
+            a.alloc_more(k).is_some()
+        };
+        let stack_ok = {
+            let mut a = LegacyStackFrameAllocator::new(base, end);
+            let mut v: Vec<PhysPageNum> = (0..ARENA).map(|_| a.alloc().unwrap()).collect();
+            for p in v.drain(..) {
+                a.dealloc(p);
+            }
+            a.alloc_more(k).is_some()
+        };
+        println!(
+            "[buddy_bench]   alloc_more({:>2}): buddy={:<4} stack={:<4}",
+            k,
+            if buddy_ok { "OK" } else { "FAIL" },
+            if stack_ok { "OK" } else { "FAIL" },
+        );
+    }
+
+    // ---- Workload C: alloc/dealloc churn (mixed) ----
+    // Repeated: alloc 64 pages, free a pseudo-random 32 of them, back-fill,
+    // measuring time. Same workload on both allocators.
+    println!("[buddy_bench] === Workload C: 1024-iter mixed churn (64-page working set) ===");
+    const ITER: usize = 1024;
+    let buddy_us = {
+        let mut a = BuddyFrameAllocator::new();
+        a.init(PhysPageNum::from(base), PhysPageNum::from(end));
+        let mut held: Vec<PhysPageNum> = (0..64).map(|_| a.alloc().unwrap()).collect();
+        let t0 = get_time_us();
+        for i in 0..ITER {
+            // pseudo-random index = (i * 1664525 + 1013904223) % 64
+            let j = ((i.wrapping_mul(1664525).wrapping_add(1013904223)) % 64) as usize;
+            let old = held[j];
+            a.dealloc(old);
+            held[j] = a.alloc().unwrap();
+        }
+        let t1 = get_time_us();
+        for p in held.drain(..) {
+            a.dealloc(p);
+        }
+        t1 - t0
+    };
+    let stack_us = {
+        let mut a = LegacyStackFrameAllocator::new(base, end);
+        let mut held: Vec<PhysPageNum> = (0..64).map(|_| a.alloc().unwrap()).collect();
+        let t0 = get_time_us();
+        for i in 0..ITER {
+            let j = ((i.wrapping_mul(1664525).wrapping_add(1013904223)) % 64) as usize;
+            let old = held[j];
+            a.dealloc(old);
+            held[j] = a.alloc().unwrap();
+        }
+        let t1 = get_time_us();
+        for p in held.drain(..) {
+            a.dealloc(p);
+        }
+        t1 - t0
+    };
+    let ops = (ITER * 2) as usize;
+    println!(
+        "[buddy_bench]   buddy : {} us total ({} ns/op avg over {} ops)",
+        buddy_us,
+        if buddy_us > 0 { (buddy_us * 1000) / ops } else { 0 },
+        ops
+    );
+    println!(
+        "[buddy_bench]   stack : {} us total ({} ns/op avg over {} ops)",
+        stack_us,
+        if stack_us > 0 { (stack_us * 1000) / ops } else { 0 },
+        ops
+    );
+
+    // arena drops here, returning the test pages to the live allocator.
+    drop(arena);
+    println!("[buddy_bench] done");
+}

@@ -80,6 +80,10 @@ pub fn munmap(start: usize, len: usize) -> isize {
     sys_munmap(start, len)
 }
 
+pub fn buddy_bench() -> isize {
+    sys_buddy_bench()
+}
+
 pub fn thread_create(entry: usize, arg: usize) -> isize {
     sys_thread_create(entry, arg)
 }

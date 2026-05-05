@@ -1,6 +1,8 @@
 use crate::config::PAGE_SIZE;
 use crate::fs::{OpenFlags, open_file};
-use crate::mm::{MapPermission, VirtAddr, translated_ref, translated_refmut, translated_str};
+use crate::mm::{
+    MapPermission, VirtAddr, run_buddy_bench, translated_ref, translated_refmut, translated_str,
+};
 use crate::task::{
     SignalFlags, current_process, current_task, current_user_token, exit_current_and_run_next,
     pid2process, suspend_current_and_run_next,
@@ -159,6 +161,14 @@ pub fn sys_munmap(start: usize, len: usize) -> isize {
         Ok(()) => 0,
         Err(()) => -1,
     }
+}
+
+/// Run the in-kernel buddy-vs-stack frame-allocator benchmark and print
+/// the timings to the kernel console. See `mm::run_buddy_bench` for the
+/// exact workloads.
+pub fn sys_buddy_bench() -> isize {
+    run_buddy_bench();
+    0
 }
 
 /// Set the calling task's stride-scheduling priority.

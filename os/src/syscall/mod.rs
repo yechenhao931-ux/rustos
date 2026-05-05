@@ -14,6 +14,7 @@ const SYSCALL_KILL: usize = 129;
 const SYSCALL_SET_PRIORITY: usize = 140;
 const SYSCALL_MUNMAP: usize = 215;
 const SYSCALL_MMAP: usize = 222;
+const SYSCALL_BUDDY_BENCH: usize = 2500;
 const SYSCALL_GET_TIME: usize = 169;
 const SYSCALL_GET_TIME_US: usize = 170;
 const SYSCALL_GETPID: usize = 172;
@@ -71,6 +72,7 @@ pub fn syscall(syscall_id: usize, args: [usize; 3]) -> isize {
         SYSCALL_SET_PRIORITY => sys_set_priority(args[0] as isize),
         SYSCALL_MMAP => sys_mmap(args[0], args[1], args[2]),
         SYSCALL_MUNMAP => sys_munmap(args[0], args[1]),
+        SYSCALL_BUDDY_BENCH => sys_buddy_bench(),
         SYSCALL_GET_TIME => sys_get_time(),
         SYSCALL_GET_TIME_US => sys_get_time_us(),
         SYSCALL_GETPID => sys_getpid(),
